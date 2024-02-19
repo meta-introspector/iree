@@ -412,6 +412,14 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
   FunctionLikeNest(passManager)
       .addPass(IREE::HAL::createElideRedundantCommandsPass);
 
+  // Initialize device globals now that we've done the analysis that is easier
+  // with them in their original target specification.
+  passManager.addPass(IREE::HAL::createInitializeDevicesPass({targetRegistry}));
+
+  // Combine the initializers we emitted during resource cache
+  // materialization.
+  passManager.addPass(IREE::Util::createCombineInitializersPass());
+
   // TODO: Maybe this should be a part of Affine lowering pass.
   // Remove if it is added there.
   // https://github.com/llvm/llvm-project/issues/78458
@@ -423,10 +431,6 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
   // TODO(benvanik): remove the need for this; some cleanup passes such as
   // SimplifyGlobalAccesses are currently broken with scf present.
   FunctionLikeNest(passManager).addPass(mlir::createConvertSCFToCFPass);
-
-  // Combine the initializers we emitted during resource cache
-  // materialization.
-  passManager.addPass(IREE::Util::createCombineInitializersPass());
 
   //----------------------------------------------------------------------------
   // Executable serialization
