@@ -42,9 +42,26 @@ using ExportExpansions = DenseMap<
     Attribute,
     SmallVector<std::pair<Attribute, IREE::HAL::ExecutableTargetAttr>>>;
 
+// Map of operations (executables, dispatches, etc) to the executable targets
+// required by those operations based on usage. If missing or empty the default
+// set should be used.
+using RequiredExecutableTargets =
+    DenseMap<Operation *, SetVector<IREE::HAL::ExecutableTargetAttr>>;
+
 //===----------------------------------------------------------------------===//
 // Utilities
 //===----------------------------------------------------------------------===//
+
+static SymbolRefAttr
+makeExportSymbolRefAttr(IREE::HAL::ExecutableOp executableOp,
+                        IREE::HAL::ExecutableVariantOp variantOp,
+                        IREE::HAL::ExecutableExportOp exportOp) {
+  return SymbolRefAttr::get(executableOp.getNameAttr(),
+                            {
+                                FlatSymbolRefAttr::get(variantOp.getNameAttr()),
+                                FlatSymbolRefAttr::get(exportOp.getNameAttr()),
+                            });
+}
 
 static void setApplicableObjects(Operation *sourceOp,
                                  IREE::HAL::ExecutableVariantOp targetOp) {
@@ -58,48 +75,169 @@ static void setApplicableObjects(Operation *sourceOp,
   targetOp.setObjectsAttr(*objects);
 }
 
-// Returns a set of executable targets required by any dispatch to the given
-// executable. Not all exports may be dispatched on the targets.
-// If the |executableOp| is public then targets specified on the module will be
-// used in addition to any from the dispatches.
-template <typename OpT>
-static SmallVector<IREE::HAL::ExecutableTargetAttr>
-gatherExecutableTargetAttrs(SymbolOpInterface executableOp,
-                            llvm::iterator_range<OpT> exportOps,
-                            const BindingLayoutAnalysis &layoutAnalysis) {
-  llvm::SetVector<IREE::HAL::ExecutableTargetAttr,
-                  SmallVector<IREE::HAL::ExecutableTargetAttr>>
-      targetAttrsSet;
-  if (executableOp.isPublic()) {
-    for (auto targetAttr :
-         IREE::HAL::DeviceTargetAttr::lookupExecutableTargets(executableOp)) {
-      targetAttrsSet.insert(targetAttr);
+// Returns a set of target devices that may be active for the given
+// operation. This will recursively walk parent operations until one with
+// the `hal.device.targets` attribute is found.
+//
+// This is a legacy mechanism for performing the search. Newer code should use
+// affinities or !hal.device analysis instead.
+static void gatherLegacyDeviceTargetAttrs(
+    Operation *op, SetVector<IREE::HAL::DeviceTargetAttr> &resultSet) {
+  auto attrId = StringAttr::get(op->getContext(), "hal.device.targets");
+  while (op) {
+    auto targetsAttr = op->getAttrOfType<ArrayAttr>(attrId);
+    if (targetsAttr) {
+      for (auto targetAttr : targetsAttr)
+        resultSet.insert(llvm::cast<IREE::HAL::DeviceTargetAttr>(targetAttr));
+      return;
     }
+    op = op->getParentOp();
   }
-  for (auto exportOp : exportOps) {
-    for (auto dispatchOp : layoutAnalysis.getExportDispatches(exportOp)) {
-      for (auto targetAttr :
-           IREE::HAL::DeviceTargetAttr::lookupExecutableTargets(dispatchOp)) {
-        targetAttrsSet.insert(targetAttr);
+  // No devices found; let caller decide what to do.
+}
+
+// Returns a set of target executable formats that may be active for the given
+// operation.
+//
+// This is a legacy mechanism for performing the search. Newer code should use
+// affinities or !hal.device analysis instead.
+static void gatherLegacyExecutableTargetAttrs(
+    Operation *op, SetVector<IREE::HAL::ExecutableTargetAttr> &resultSet) {
+  SetVector<IREE::HAL::DeviceTargetAttr> deviceTargetSet;
+  gatherLegacyDeviceTargetAttrs(op, deviceTargetSet);
+  for (auto deviceTargetAttr : deviceTargetSet) {
+    deviceTargetAttr.getExecutableTargets(resultSet);
+  }
+}
+
+// Gathers the set of device targets potentially referenced by the given
+// affinity. Targets are ordered by most likely to least likely.
+// Returns failure if analysis fails and the result set is incomplete.
+static void
+gatherDeviceAffinityTargets(IREE::Stream::AffinityAttr affinityAttr,
+                            Operation *fromOp, SymbolTable &symbolTable,
+                            SetVector<IREE::HAL::DeviceTargetAttr> &resultSet) {
+  // We currently only know how to handle HAL device affinities.
+  // We could support other ones via an interface but instead we just fall back
+  // to default logic if no affinity or an unknown one is found.
+  auto deviceAffinityAttr =
+      dyn_cast_if_present<IREE::HAL::DeviceAffinityAttr>(affinityAttr);
+  if (!deviceAffinityAttr) {
+    gatherLegacyDeviceTargetAttrs(fromOp, resultSet);
+    return;
+  }
+
+  // Recursively resolve the referenced device into targets.
+  SetVector<Attribute> worklist;
+  worklist.insert(deviceAffinityAttr.getDevice());
+  do {
+    auto attr = worklist.pop_back_val();
+    if (!TypeSwitch<Attribute, bool>(attr)
+             .Case<SymbolRefAttr>([&](auto symRefAttr) {
+               auto globalOp =
+                   symbolTable
+                       .lookupNearestSymbolFrom<IREE::Util::GlobalOpInterface>(
+                           fromOp, symRefAttr);
+               assert(globalOp && "global reference must be valid");
+               if (auto initialValueAttr = globalOp.getGlobalInitialValue()) {
+                 // Global with a device initialization value we can analyze.
+                 worklist.insert(initialValueAttr);
+                 return true;
+               } else {
+                 return false;
+               }
+             })
+             .Case<IREE::HAL::DeviceTargetAttr>([&](auto targetAttr) {
+               resultSet.insert(targetAttr);
+               return true;
+             })
+             .Case<IREE::HAL::DeviceFallbackAttr>([&](auto fallbackAttr) {
+               worklist.insert(fallbackAttr.getName());
+               return true;
+             })
+             .Case<IREE::HAL::DeviceSelectAttr>([&](auto selectAttr) {
+               worklist.insert(selectAttr.getDevices().begin(),
+                               selectAttr.getDevices().end());
+               return true;
+             })
+             .Default([](auto attr) { return false; })) {
+      // No initial value means fall back to defaults. We do that by
+      // inserting all knowable targets.
+      gatherLegacyDeviceTargetAttrs(fromOp, resultSet);
+      return;
+    }
+  } while (!worklist.empty());
+}
+
+// Gathers all executable targets that may be used by the given dispatch op.
+static void gatherRequiredExecutableTargets(
+    IREE::Stream::CmdDispatchOp dispatchOp, SymbolTable &symbolTable,
+    SetVector<IREE::HAL::ExecutableTargetAttr> &resultSet) {
+  // Get the affinity from the op or an ancestor. Note that there may be no
+  // affinity specified at all.
+  auto affinityAttr = IREE::Stream::AffinityAttr::lookup(dispatchOp);
+
+  // Gather the device targets that are referenced by the affinity.
+  SetVector<IREE::HAL::DeviceTargetAttr> deviceTargetSet;
+  gatherDeviceAffinityTargets(affinityAttr, dispatchOp, symbolTable,
+                              deviceTargetSet);
+
+  // Add all executable targets on the device targets.
+  for (auto deviceTargetAttr : deviceTargetSet) {
+    resultSet.insert(deviceTargetAttr.getExecutableTargets().begin(),
+                     deviceTargetAttr.getExecutableTargets().end());
+  }
+}
+
+// Builds a map of executable and dispatch ops to the executable targets that
+// may be required.
+static RequiredExecutableTargets
+buildRequiredExecutableTargetsMap(ModuleOp moduleOp, SymbolTable &symbolTable,
+                                  BindingLayoutAnalysis &layoutAnalysis) {
+  RequiredExecutableTargets resultMap;
+  for (auto executableOp : moduleOp.getOps<IREE::HAL::ExecutableSourceOp>()) {
+    auto &executableTargetAttrs = resultMap[executableOp];
+    for (auto exportOp : executableOp.getOps<IREE::HAL::ExecutableExportOp>()) {
+      for (auto dispatchOp : layoutAnalysis.getExportDispatches(exportOp)) {
+        auto &dispatchTargetAttrs = resultMap[dispatchOp];
+        gatherRequiredExecutableTargets(dispatchOp, symbolTable,
+                                        dispatchTargetAttrs);
+        executableTargetAttrs.insert(dispatchTargetAttrs.begin(),
+                                     dispatchTargetAttrs.end());
       }
     }
+    if (executableOp.isPublic()) {
+      // Public executables need all possible targets.
+      gatherLegacyExecutableTargetAttrs(executableOp, executableTargetAttrs);
+    }
   }
-  auto targetAttrs = targetAttrsSet.takeVector();
-  llvm::stable_sort(targetAttrs, [](auto lhs, auto rhs) {
-    return lhs.getSymbolNameFragment() < rhs.getSymbolNameFragment();
-  });
-  return targetAttrs;
+  for (auto executableOp : moduleOp.getOps<IREE::Stream::ExecutableOp>()) {
+    auto &executableTargetAttrs = resultMap[executableOp];
+    for (auto exportOp :
+         executableOp.getOps<IREE::Stream::ExecutableExportOp>()) {
+      for (auto dispatchOp : layoutAnalysis.getExportDispatches(exportOp)) {
+        auto &dispatchTargetAttrs = resultMap[dispatchOp];
+        gatherRequiredExecutableTargets(dispatchOp, symbolTable,
+                                        dispatchTargetAttrs);
+        executableTargetAttrs.insert(dispatchTargetAttrs.begin(),
+                                     dispatchTargetAttrs.end());
+      }
+    }
+    if (executableOp.isPublic()) {
+      // Public executables need all possible targets.
+      gatherLegacyExecutableTargetAttrs(executableOp, executableTargetAttrs);
+    }
+  }
+  return resultMap;
 }
 
 // Updates the target entry point symbols of |dispatchOp| to the expanded set of
 // variant exports in |exportExpansions|.
-static void updateDispatchTargets(IREE::Stream::CmdDispatchOp dispatchOp,
-                                  const ExportExpansions &exportExpansions) {
-  DenseSet<IREE::HAL::ExecutableTargetAttr> requiredTargetAttrs;
-  for (auto targetAttr :
-       IREE::HAL::DeviceTargetAttr::lookupExecutableTargets(dispatchOp)) {
-    requiredTargetAttrs.insert(targetAttr);
-  }
+static void
+updateDispatchTargets(IREE::Stream::CmdDispatchOp dispatchOp,
+                      const ExportExpansions &exportExpansions,
+                      RequiredExecutableTargets &requiredExecutableTargets) {
+  auto &requiredTargetAttrs = requiredExecutableTargets[dispatchOp];
   SmallVector<Attribute> newAttrs;
   for (auto oldAttr : dispatchOp.getEntryPointRefs()) {
     auto it = exportExpansions.find(oldAttr);
@@ -108,8 +246,11 @@ static void updateDispatchTargets(IREE::Stream::CmdDispatchOp dispatchOp,
       continue;
     }
     for (auto [newAttr, targetAttr] : it->second) {
-      // Filter the new expansions to only those used by the dispatch.
-      if (requiredTargetAttrs.contains(targetAttr))
+      // Filter the new expansions to only those used by the dispatch (if we
+      // have a valid filter).
+      if (requiredTargetAttrs.empty())
+        newAttrs.push_back(newAttr);
+      else if (requiredTargetAttrs.contains(targetAttr))
         newAttrs.push_back(newAttr);
     }
   }
@@ -121,26 +262,19 @@ static void updateDispatchTargets(IREE::Stream::CmdDispatchOp dispatchOp,
 // hal.executable.source materialization
 //===----------------------------------------------------------------------===//
 
-SymbolRefAttr makeExportSymbolRefAttr(IREE::HAL::ExecutableOp executableOp,
-                                      IREE::HAL::ExecutableVariantOp variantOp,
-                                      IREE::HAL::ExecutableExportOp exportOp) {
-  return SymbolRefAttr::get(executableOp.getNameAttr(),
-                            {
-                                FlatSymbolRefAttr::get(variantOp.getNameAttr()),
-                                FlatSymbolRefAttr::get(exportOp.getNameAttr()),
-                            });
-}
-
-static void
-materializeExecutableFromSourceOp(IREE::HAL::ExecutableSourceOp sourceOp,
-                                  BindingLayoutAnalysis &layoutAnalysis) {
+static void materializeExecutableFromSourceOp(
+    IREE::HAL::ExecutableSourceOp sourceOp,
+    BindingLayoutAnalysis &layoutAnalysis,
+    RequiredExecutableTargets &requiredExecutableTargets) {
   // Gather the required executable targets based on the dispatches to exports
   // in the source op.
-  auto targetAttrs = gatherExecutableTargetAttrs(
-      sourceOp, sourceOp.getOps<IREE::HAL::ExecutableExportOp>(),
-      layoutAnalysis);
+  SmallVector<IREE::HAL::ExecutableTargetAttr> targetAttrs(
+      requiredExecutableTargets[sourceOp].getArrayRef());
   if (targetAttrs.empty())
     return;
+  llvm::stable_sort(targetAttrs, [](auto lhs, auto rhs) {
+    return lhs.getSymbolNameFragment() < rhs.getSymbolNameFragment();
+  });
 
   // Create the op that will contain the translated executable.
   OpBuilder moduleBuilder(sourceOp);
@@ -193,7 +327,8 @@ materializeExecutableFromSourceOp(IREE::HAL::ExecutableSourceOp sourceOp,
   // Update all dispatch sites to reference the new expanded variants.
   for (auto exportOp : sourceExportOps) {
     for (auto dispatchOp : layoutAnalysis.getExportDispatches(exportOp)) {
-      updateDispatchTargets(dispatchOp, exportExpansions);
+      updateDispatchTargets(dispatchOp, exportExpansions,
+                            requiredExecutableTargets);
     }
   }
 
@@ -331,7 +466,8 @@ cloneFuncWithInterface(mlir::func::FuncOp sourceFuncOp,
 static LogicalResult
 declareEntryPointOps(IREE::Stream::ExecutableOp sourceExecutableOp,
                      IREE::HAL::ExecutableOp targetExecutableOp,
-                     const BindingLayoutAnalysis &layoutAnalysis) {
+                     const BindingLayoutAnalysis &layoutAnalysis,
+                     RequiredExecutableTargets &requiredExecutableTargets) {
   auto variantOps =
       targetExecutableOp.getBlock().getOps<IREE::HAL::ExecutableVariantOp>();
   OpBuilder executableBuilder(&targetExecutableOp.getBlock().front());
@@ -441,7 +577,8 @@ declareEntryPointOps(IREE::Stream::ExecutableOp sourceExecutableOp,
 
     // Update all dispatch sites to reference the new expanded variants.
     for (auto dispatchOp : layoutAnalysis.getExportDispatches(exportOp)) {
-      updateDispatchTargets(dispatchOp, exportExpansions);
+      updateDispatchTargets(dispatchOp, exportExpansions,
+                            requiredExecutableTargets);
     }
   }
 
@@ -554,11 +691,16 @@ struct MaterializeInterfacesPass
     SymbolTable symbolTable(moduleOp);
     BindingLayoutAnalysis layoutAnalysis(moduleOp, symbolTable);
 
+    // Gather the required executable targets per executable and dispatch site.
+    auto requiredExecutableTargets = buildRequiredExecutableTargetsMap(
+        moduleOp, symbolTable, layoutAnalysis);
+
     // Handle any hand-authored executables; these only need variant expansion
     // and no layout analysis as the user specified the layout themselves.
     for (auto sourceOp : llvm::make_early_inc_range(
              moduleOp.getOps<IREE::HAL::ExecutableSourceOp>())) {
-      materializeExecutableFromSourceOp(sourceOp, layoutAnalysis);
+      materializeExecutableFromSourceOp(sourceOp, layoutAnalysis,
+                                        requiredExecutableTargets);
     }
 
     // Processes all executables within the input module and produce the
@@ -575,10 +717,13 @@ struct MaterializeInterfacesPass
       // variants for based on the dispatches performed. Not all exports may be
       // used on any particular target but we let future DCE/pruning passes
       // remove them instead of modifying the inner modules here.
-      auto targetAttrs =
-          gatherExecutableTargetAttrs(sourceOp, exportOps, layoutAnalysis);
+      SmallVector<IREE::HAL::ExecutableTargetAttr> targetAttrs(
+          requiredExecutableTargets[sourceOp].getArrayRef());
       if (targetAttrs.empty())
-        continue;
+        return;
+      llvm::stable_sort(targetAttrs, [](auto lhs, auto rhs) {
+        return lhs.getSymbolNameFragment() < rhs.getSymbolNameFragment();
+      });
 
       // Create the op that will contain the translated executable.
       OpBuilder builder = OpBuilder::atBlockEnd(moduleOp.getBody());
@@ -605,8 +750,8 @@ struct MaterializeInterfacesPass
       }
 
       // Define interfaces for each exported function based on analysis.
-      if (failed(
-              declareEntryPointOps(sourceOp, executableOp, layoutAnalysis))) {
+      if (failed(declareEntryPointOps(sourceOp, executableOp, layoutAnalysis,
+                                      requiredExecutableTargets))) {
         return signalPassFailure();
       }
 

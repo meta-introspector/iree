@@ -2,12 +2,16 @@
 
 // Tests an executable with a workgroup count region specified.
 
-module attributes {hal.device.targets = [
-  #hal.device.target<"llvm-cpu", [
+module attributes {
+  stream.affinity = #hal.device.affinity<@default_device>
+} {
+  // The default device when none is specified.
+  // Functions and scopes can override the target device.
+  util.global private @default_device = #hal.device.target<"cpu", [
     #hal.executable.target<"llvm-cpu", "arm_64">,
     #hal.executable.target<"llvm-cpu", "x86_64">
-  ]>
-]} {
+  ]> : !hal.device
+
   // CHECK: #pipeline_layout = #hal.pipeline.layout<
   // CHECK-SAME: push_constants = 1
   // CHECK-SAME: sets = [
@@ -73,15 +77,18 @@ module attributes {hal.device.targets = [
 // dispatched on.
 
 module attributes {
+  stream.affinity = #hal.device.affinity<@default_device>
+} {
   // The default device when none is specified.
   // Functions and scopes can override the target device.
-  hal.device.targets = [
-    #hal.device.target<"cpu", [
-      #hal.executable.target<"llvm-cpu", "arm_64">,
-      #hal.executable.target<"llvm-cpu", "x86_64">
-    ]>
-  ]
-} {
+  util.global private @default_device = #hal.device.target<"cpu", [
+    #hal.executable.target<"llvm-cpu", "arm_64">,
+    #hal.executable.target<"llvm-cpu", "x86_64">
+  ]> : !hal.device
+  util.global private @riscv_device =  #hal.device.target<"cpu", [
+    #hal.executable.target<"llvm-cpu", "riscv_32">
+  ]> : !hal.device
+
   // CHECK: hal.executable private @ex
   // CHECK:   hal.executable.variant public @arm_64
   // CHECK:   hal.executable.variant public @riscv_32
@@ -116,11 +123,7 @@ module attributes {
   // not get assigned the arm_64/x86_64 variant entry points.
   // CHECK-LABEL: @using_specialized
   util.func public @using_specialized(%arg0: !stream.resource<transient>, %arg1: index) -> !stream.timepoint attributes {
-    hal.device.targets = [
-      #hal.device.target<"cpu", [
-        #hal.executable.target<"llvm-cpu", "riscv_32">
-      ]>
-    ]
+    stream.affinity = #hal.device.affinity<@riscv_device>
   } {
     %c0 = arith.constant 0 : index
     %0 = stream.cmd.execute with(%arg0 as %arg2: !stream.resource<transient>{%arg1}) {
@@ -144,15 +147,18 @@ module attributes {
 // themselves.
 
 module attributes {
+  stream.affinity = #hal.device.affinity<@default_device>
+} {
   // The default device when none is specified.
   // Functions and scopes can override the target device.
-  hal.device.targets = [
-    #hal.device.target<"cpu", [
-      #hal.executable.target<"llvm-cpu", "arm_64">,
-      #hal.executable.target<"llvm-cpu", "x86_64">
-    ]>
-  ]
-} {
+  util.global private @default_device = #hal.device.target<"cpu", [
+    #hal.executable.target<"llvm-cpu", "arm_64">,
+    #hal.executable.target<"llvm-cpu", "x86_64">
+  ]> : !hal.device
+  util.global private @riscv_device =  #hal.device.target<"cpu", [
+    #hal.executable.target<"llvm-cpu", "riscv_32">
+  ]> : !hal.device
+
   // CHECK: hal.executable private @ex
   // CHECK:   hal.executable.variant public @arm_64
   // CHECK:   hal.executable.variant public @riscv_32
@@ -188,11 +194,7 @@ module attributes {
   // not get assigned the arm_64/x86_64 variant entry points.
   // CHECK-LABEL: @using_specialized
   util.func public @using_specialized(%arg0: !stream.resource<transient>, %arg1: index) -> !stream.timepoint attributes {
-    hal.device.targets = [
-      #hal.device.target<"cpu", [
-        #hal.executable.target<"llvm-cpu", "riscv_32">
-      ]>
-    ]
+    stream.affinity = #hal.device.affinity<@riscv_device>
   } {
     %c0 = arith.constant 0 : index
     %0 = stream.cmd.execute with(%arg0 as %arg2: !stream.resource<transient>{%arg1}) {
@@ -221,6 +223,10 @@ module attributes {
     ]>
   ]
 } {
+  util.global private @riscv_device =  #hal.device.target<"cpu", [
+    #hal.executable.target<"llvm-cpu", "riscv_32">
+  ]> : !hal.device
+
   // CHECK: hal.executable public @ex
   // CHECK:   hal.executable.variant public @arm_64
   // CHECK:   hal.executable.variant public @riscv_32
@@ -239,11 +245,7 @@ module attributes {
   }
   // CHECK-LABEL: @using_specialized
   util.func public @using_specialized(%arg0: !stream.resource<transient>, %arg1: index) -> !stream.timepoint attributes {
-    hal.device.targets = [
-      #hal.device.target<"cpu", [
-        #hal.executable.target<"llvm-cpu", "riscv_32">
-      ]>
-    ]
+    stream.affinity = #hal.device.affinity<@riscv_device>
   } {
     %c0 = arith.constant 0 : index
     %0 = stream.cmd.execute with(%arg0 as %arg2: !stream.resource<transient>{%arg1}) {
