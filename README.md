@@ -63,3 +63,8 @@ See [our website](https://iree.dev/) for more information.
 
 IREE is licensed under the terms of the Apache 2.0 License with LLVM Exceptions.
 See [LICENSE](LICENSE) for more information.
+
+## prs
+
+gh pr  list  --limit 991 --json author,baseRefName,headRefName,headRepository,headRepositoryOwner,id,isCrossRepository,labels,number,state,url 
+jq -r  '.[]| "git remote add " + .headRepositoryOwner.login +  " https://github.com/" + .headRepositoryOwner.login + "/" + .headRepository.name ' prs.json |sort -u > remotes.sh
